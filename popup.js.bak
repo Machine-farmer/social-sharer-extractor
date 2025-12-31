@@ -1,0 +1,236 @@
+// popup.js
+
+let extractedData = {
+  facebook: [],
+  x: []
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  const extractBtn = document.getElementById('extractBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const statusEl = document.getElementById('status');
+  const resultsEl = document.getElementById('results');
+  
+  // UI Handlers
+  extractBtn.addEventListener('click', async () => {
+    extractBtn.disabled = true;
+    showStatus('Injecting script... DO NOT CLOSE THIS POPUP.', 'info');
+
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      
+      if (!tab.url.includes('facebook.com') && !tab.url.includes('x.com')) {
+        throw new Error('Please go to Facebook or X/Twitter');
+      }
+
+      showStatus('Extracting... Watch the page! The script will hover over each share automatically.', 'info');
+
+      // Execute the "Console Script" logic inside the tab
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: runExtractionOnPage,
+        args: [tab.url.includes('facebook.com') ? 'facebook' : 'x']
+      });
+
+      if (!results || !results[0] || !results[0].result) {
+        throw new Error('Script returned no data. Ensure the dialog is open.');
+      }
+
+      const data = results[0].result;
+      
+      if (tab.url.includes('facebook.com')) extractedData.facebook = data;
+      else extractedData.x = data;
+
+      renderResults();
+      showStatus(`Success! Found ${data.length} shares.`, 'success');
+
+    } catch (error) {
+      console.error(error);
+      showStatus(error.message, 'error');
+    } finally {
+      extractBtn.disabled = false;
+    }
+  });
+
+  clearBtn.addEventListener('click', () => {
+    extractedData = { facebook: [], x: [] };
+    renderResults();
+    showStatus('', 'info');
+  });
+
+  document.getElementById('copyAll').addEventListener('click', () => {
+    const all = [...extractedData.facebook, ...extractedData.x];
+    const csv = "Name\tTime\tLink\n" + all.map(r => `${r.name}\t${r.time}\t${r.url}`).join("\n");
+    navigator.clipboard.writeText(csv);
+    showStatus('Copied to clipboard!', 'success');
+  });
+});
+
+function renderResults() {
+  const list = [...extractedData.facebook, ...extractedData.x];
+  const container = document.getElementById('results');
+  
+  if (list.length === 0) {
+    container.innerHTML = '<div class="empty-state">No data yet</div>';
+    return;
+  }
+
+  container.innerHTML = list.map(item => `
+    <div class="share-card" style="border-bottom:1px solid #eee; padding:8px;">
+      <div style="font-weight:bold">${escapeHtml(item.name)}</div>
+      <div style="color:#2e7d32">🕒 ${escapeHtml(item.time)}</div>
+      <div style="font-size:0.85em"><a href="${item.url}" target="_blank">View Post</a></div>
+    </div>
+  `).join('');
+}
+
+function showStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + type;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function escapeHtml(text) {
+  if(!text) return '';
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ======================================================
+// THIS IS THE "CONSOLE SCRIPT" WRAPPED FOR EXTENSION
+// ======================================================
+async function runExtractionOnPage(platform) {
+  if (platform !== 'facebook') {
+    // Simple X/Twitter Logic (No hover needed usually)
+    const items = [];
+    document.querySelectorAll('[data-testid="tweet"]').forEach(t => {
+      const time = t.querySelector('time')?.getAttribute('datetime');
+      const name = t.querySelector('[data-testid="User-Name"]')?.textContent;
+      const link = t.querySelector('a[href*="/status/"]')?.href;
+      if(name) items.push({ name, time: time || "Unknown", url: link || "" });
+    });
+    return items;
+  }
+
+  // --- FACEBOOK LOGIC (COPIED FROM CONSOLE SCRIPT) ---
+  const results = [];
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  const DATE_REGEX = /[A-Z][a-z]+ \d{1,2} [A-Z][a-z]+ \d{4} at \d{1,2}:\d{2}/;
+
+  const dialog = document.querySelector('[role="dialog"]');
+  if (!dialog) return []; // Fail gracefully
+
+  const rows = Array.from(dialog.querySelectorAll('[data-ad-rendering-role="profile_name"]'));
+
+  // 1. Setup Observer
+  let foundTooltipText = null;
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const text = (node.innerText || "").trim();
+          if (DATE_REGEX.test(text)) {
+            foundTooltipText = text.match(DATE_REGEX)[0];
+          }
+        }
+      }
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  // 2. The Nuclear Hover Function
+  async function triggerDeepHover(element) {
+    if (!element) return;
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    element.focus({ preventScroll: true });
+    
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + (rect.width / 2);
+    const y = rect.top + (rect.height / 2);
+
+    const opts = {
+      bubbles: true, cancelable: true, view: window,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      pointerType: 'mouse', button: 0, buttons: 1
+    };
+
+    // Target element + all children (to hit the specific text span)
+    const targets = [element, ...element.querySelectorAll('span, div')];
+    const target = targets[targets.length - 1] || element;
+
+    target.dispatchEvent(new PointerEvent('pointerover', opts));
+    target.dispatchEvent(new MouseEvent('mouseover', opts));
+    target.dispatchEvent(new PointerEvent('pointerenter', opts));
+    target.dispatchEvent(new MouseEvent('mouseenter', opts));
+    
+    // Wiggle
+    for(let i = 0; i < 4; i++) {
+        await wait(60); 
+        target.dispatchEvent(new MouseEvent('mousemove', { ...opts, clientX: x + i }));
+    }
+  }
+
+  // 3. Main Loop
+  for (const row of rows) {
+    // Get Name
+    const nameEl = row.querySelector('strong') || row.querySelector('span');
+    const name = nameEl ? nameEl.textContent.trim() : "Unknown";
+
+    // Get Link
+    let timestampLink = null;
+    let parent = row.parentElement;
+    const profileHref = row.querySelector('a')?.href;
+
+    for (let k = 0; k < 6 && parent; k++) {
+        const links = Array.from(parent.querySelectorAll('a[role="link"], a[href*="facebook.com"]'));
+        
+        // Priority 1: Standard Post Link
+        let candidate = links.find(l => (l.href.includes('/posts/') || l.href.includes('/permalink/')) && l.href !== profileHref);
+        
+        // Priority 2: Date Aria Label
+        if (!candidate) candidate = links.find(l => l.getAttribute('aria-label') && /\d{4}/.test(l.getAttribute('aria-label')) && l.href !== profileHref);
+
+        // Priority 3: Any other link near the name
+        if (!candidate) candidate = links.find(l => l.href && l.href.length > 25 && l.href !== profileHref && !l.textContent.includes("Comment"));
+
+        if (candidate) {
+            timestampLink = candidate;
+            break;
+        }
+        parent = parent.parentElement;
+    }
+
+    if (timestampLink) {
+        foundTooltipText = null;
+        
+        // Visual Feedback for user
+        const originalBorder = timestampLink.style.border;
+        timestampLink.style.border = "2px solid blue";
+
+        await triggerDeepHover(timestampLink);
+
+        // Wait for observer (max 2s)
+        let attempts = 0;
+        while(!foundTooltipText && attempts < 20) {
+            await wait(100);
+            attempts++;
+        }
+
+        if (foundTooltipText) {
+            timestampLink.style.border = "2px solid #0f0"; // Green
+            results.push({ name, time: foundTooltipText, url: timestampLink.href });
+        } else {
+            timestampLink.style.border = "2px solid red"; // Red
+            // Fallback: If tooltip failed, try to get relative time text
+            results.push({ name, time: "Hover failed", url: timestampLink.href });
+        }
+
+        // Cleanup
+        await wait(150);
+        timestampLink.style.border = originalBorder;
+    }
+  }
+
+  observer.disconnect();
+  return results;
+}
