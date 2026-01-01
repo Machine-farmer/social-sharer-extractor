@@ -10,8 +10,20 @@ document.addEventListener('DOMContentLoaded', () => {
   const clearBtn = document.getElementById('clearBtn');
   const statusEl = document.getElementById('status');
   const resultsEl = document.getElementById('results');
-  
-  // UI Handlers
+  const statsEl = document.getElementById('stats');
+  const tabsEl = document.getElementById('tabs');
+  const exportOptionsEl = document.getElementById('exportOptions');
+
+  // Tab switching
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderResults(btn.dataset.tab);
+    });
+  });
+
+  // Extract button
   extractBtn.addEventListener('click', async () => {
     extractBtn.disabled = true;
     showStatus('Injecting script... DO NOT CLOSE THIS POPUP.', 'info');
@@ -19,105 +31,213 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       
-      if (!tab.url.includes('facebook.com') && !tab.url.includes('x.com')) {
-        throw new Error('Please go to Facebook or X/Twitter');
-      }
+      if (!tab.url) throw new Error("Cannot access this page");
+
+      const isFacebook = tab.url.includes('facebook.com');
+      const isX = tab.url.includes('twitter.com') || tab.url.includes('x.com');
+
+      if (!isFacebook && !isX) throw new Error("Please navigate to Facebook or X/Twitter");
 
       showStatus('Extracting... Auto-scrolling and hovering. This takes time to be accurate.', 'info');
 
-      // Execute the "Console Script" logic inside the tab
+      // Execute the extraction script
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: runExtractionOnPage,
-        args: [tab.url.includes('facebook.com') ? 'facebook' : 'x']
+        args: [isFacebook ? 'facebook' : 'x']
       });
 
       if (!results || !results[0] || !results[0].result) {
-        throw new Error('Script returned no data. Ensure the dialog is open.');
+        throw new Error("Script returned no data. Ensure the dialog is open.");
       }
 
       const data = results[0].result;
       
-      if (tab.url.includes('facebook.com')) extractedData.facebook = data;
+      if (data.length === 0) {
+        showStatus('No share data found. Ensure the shares dialog is open.', 'error');
+        extractBtn.disabled = false;
+        return;
+      }
+
+      if (isFacebook) extractedData.facebook = data;
       else extractedData.x = data;
-
-      renderResults();
+      
+      updateStats();
+      renderResults('all');
       showStatus(`Success! Found ${data.length} shares.`, 'success');
-
+      
+      // Show export controls
+      if (statsEl) statsEl.style.display = 'flex';
+      if (tabsEl) tabsEl.style.display = 'flex';
+      if (exportOptionsEl) exportOptionsEl.style.display = 'flex';
+      
     } catch (error) {
-      console.error(error);
-      showStatus(error.message, 'error');
-    } finally {
-      extractBtn.disabled = false;
+      console.error('Extraction error:', error);
+      showStatus(`Error: ${error.message}`, 'error');
     }
+
+    extractBtn.disabled = false;
   });
 
+  // Clear button
   clearBtn.addEventListener('click', () => {
     extractedData = { facebook: [], x: [] };
-    renderResults();
+    updateStats();
+    renderResults('all');
+    if (statsEl) statsEl.style.display = 'none';
+    if (tabsEl) tabsEl.style.display = 'none';
+    if (exportOptionsEl) exportOptionsEl.style.display = 'none';
     showStatus('', 'info');
   });
 
-  document.getElementById('copyAll').addEventListener('click', () => {
+  // --- EXPORT HANDLERS ---
+
+  // Export JSON
+  document.getElementById('exportJSON').addEventListener('click', () => {
     const all = [...extractedData.facebook, ...extractedData.x];
-    const csv = "Name\tTime\tLink\n" + all.map(r => `${r.name}\t${r.time}\t${r.url}`).join("\n");
-    navigator.clipboard.writeText(csv);
-    showStatus('Copied to clipboard!', 'success');
+    downloadFile(JSON.stringify(all, null, 2), 'shares.json', 'application/json');
+  });
+
+  // Export CSV (Comma Separated for File)
+  document.getElementById('exportCSV').addEventListener('click', () => {
+    const all = [...extractedData.facebook, ...extractedData.x];
+    const csvContent = formatData(all, true, ","); // Use comma for file
+    downloadFile(csvContent, 'shares.csv', 'text/csv');
+  });
+
+  // Copy to Clipboard (Tab Separated for Paste)
+  document.getElementById('copyAll').addEventListener('click', async () => {
+    const all = [...extractedData.facebook, ...extractedData.x];
+    const tsvContent = formatData(all, false, "\t"); // Use TAB for clipboard columns
+    await navigator.clipboard.writeText(tsvContent);
+    showStatus('Data copied! Ready to paste into Excel/Sheets.', 'success');
+    setTimeout(() => showStatus('', 'info'), 3000);
   });
 });
 
-function renderResults() {
-  const list = [...extractedData.facebook, ...extractedData.x];
-  const container = document.getElementById('results');
+// Data Formatter (Supports CSV and TSV)
+function formatData(data, includeHeader, delimiter) {
+  const columns = ['Username', 'Time', 'iso_time', 'profile_link', 'group_link', 'post_link'];
   
-  if (list.length === 0) {
-    container.innerHTML = '<div class="empty-state">No data yet</div>';
+  let output = "";
+  if (includeHeader) {
+    output += columns.join(delimiter) + "\n";
+  }
+
+  output += data.map(row => {
+    // Sanitize fields (escape quotes if needed)
+    const sanitize = (str) => {
+      let s = String(str || '');
+      // If data contains the delimiter, newlines, or quotes, wrap it in quotes
+      if (s.includes(delimiter) || s.includes('"') || s.includes('\n')) {
+        s = `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    };
+
+    return [
+      sanitize(row.username),
+      sanitize(row.time),
+      sanitize(row.isoTime),
+      sanitize(row.profileUrl),
+      sanitize(row.groupUrl),
+      sanitize(row.postUrl)
+    ].join(delimiter);
+  }).join("\n");
+
+  return output;
+}
+
+function downloadFile(content, filename, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// UI Helpers
+function showStatus(message, type) {
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = message;
+  statusEl.className = 'status';
+  if (message) {
+    statusEl.classList.add('show');
+    if (type) statusEl.classList.add(type);
+  }
+}
+
+function updateStats() {
+  const total = extractedData.facebook.length + extractedData.x.length;
+  const fbCount = document.getElementById('fbCount');
+  const xCount = document.getElementById('xCount');
+  const totalCount = document.getElementById('totalCount');
+
+  if(fbCount) fbCount.textContent = extractedData.facebook.length;
+  if(xCount) xCount.textContent = extractedData.x.length;
+  if(totalCount) totalCount.textContent = total;
+}
+
+function renderResults(filter) {
+  const resultsEl = document.getElementById('results');
+  let data = [];
+  
+  if (!filter || filter === 'all' || filter === 'facebook') data = data.concat(extractedData.facebook);
+  if (!filter || filter === 'all' || filter === 'x') data = data.concat(extractedData.x);
+
+  if (data.length === 0) {
+    resultsEl.innerHTML = `<div class="empty-state">No results yet.</div>`;
     return;
   }
 
-  container.innerHTML = list.map(item => `
-    <div class="share-card" style="border-bottom:1px solid #eee; padding:8px;">
-      <div style="font-weight:bold">${escapeHtml(item.name)}</div>
-      <div style="color:#2e7d32">🕒 ${escapeHtml(item.time)}</div>
-      <div style="font-size:0.85em"><a href="${item.url}" target="_blank">View Post</a></div>
+  resultsEl.innerHTML = data.map(item => `
+    <div class="share-card">
+      <div class="name">${escapeHtml(item.username)}</div>
+      <div class="time">🕐 ${escapeHtml(item.time)}</div>
+      <div class="link">📄 <a href="${item.postUrl}" target="_blank">View Post</a></div>
+      ${item.groupUrl ? `<div class="link" style="color:#666">👥 Group: <a href="${item.groupUrl}" target="_blank">Link</a></div>` : ''}
     </div>
   `).join('');
 }
 
-function showStatus(msg, type) {
-  const el = document.getElementById('status');
-  el.textContent = msg;
-  el.className = 'status ' + type;
-  el.style.display = msg ? 'block' : 'none';
-}
-
 function escapeHtml(text) {
-  if(!text) return '';
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const div = document.createElement('div');
+  div.textContent = text || '';
+  return div.innerHTML;
 }
 
 // ======================================================
-// MAIN EXTRACTION LOGIC
+// EXTRACTION ENGINE (Injected into Page)
 // ======================================================
 async function runExtractionOnPage(platform) {
-  if (platform !== 'facebook') {
-    // Simple X/Twitter Logic
-    const items = [];
-    document.querySelectorAll('[data-testid="tweet"]').forEach(t => {
-      const time = t.querySelector('time')?.getAttribute('datetime');
-      const name = t.querySelector('[data-testid="User-Name"]')?.textContent;
-      const link = t.querySelector('a[href*="/status/"]')?.href;
-      if(name) items.push({ name, time: time || "Unknown", url: link || "" });
-    });
-    return items;
-  }
-
-  // --- FACEBOOK LOGIC ---
   const results = [];
   const processedIds = new Set();
   const wait = (ms) => new Promise(r => setTimeout(r, ms));
   const DATE_REGEX = /[A-Z][a-z]+ \d{1,2} [A-Z][a-z]+ \d{4} at \d{1,2}:\d{2}|[A-Z][a-z]+, [A-Z][a-z]+ \d{1,2}, \d{4}/;
 
+  // --- X/Twitter Logic ---
+  if (platform !== 'facebook') {
+    document.querySelectorAll('[data-testid="tweet"]').forEach(t => {
+      const time = t.querySelector('time')?.getAttribute('datetime');
+      const name = t.querySelector('[data-testid="User-Name"]')?.textContent;
+      const link = t.querySelector('a[href*="/status/"]')?.href;
+      if(name) {
+        results.push({ 
+            username: name, 
+            time: time || "Unknown", 
+            isoTime: time || "", 
+            profileUrl: "", 
+            groupUrl: "", 
+            postUrl: link || "" 
+        });
+      }
+    });
+    return results;
+  }
+
+  // --- FACEBOOK LOGIC ---
   const dialog = document.querySelector('[role="dialog"]');
   if (!dialog) return [];
 
@@ -128,18 +248,18 @@ async function runExtractionOnPage(platform) {
   });
   if (!scrollableDiv) scrollableDiv = dialog;
 
-  // 1. Setup Observer
+  // 1. Setup Tooltip Observer
   let foundTooltipText = null;
   const observer = new MutationObserver((mutations) => {
     for (const m of mutations) {
-      for (const node of m.addedNodes) {
-        if (node.nodeType === Node.ELEMENT_NODE) {
+      m.addedNodes.forEach(node => {
+        if (node.nodeType === 1) {
           const text = (node.innerText || "").trim();
           if (DATE_REGEX.test(text)) {
             foundTooltipText = text.match(DATE_REGEX)[0];
           }
         }
-      }
+      });
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
@@ -173,42 +293,49 @@ async function runExtractionOnPage(platform) {
     }
   }
 
-  // 3. MAIN LOOP
-  // We keep running until the scroll mechanism explicitly tells us to stop
+  // 3. Extraction Loop
+  let noNewDataCount = 0;
+  let safetyCount = 0;
   let isScrollingFinished = false;
-  
-  while (!isScrollingFinished) {
+
+  while (!isScrollingFinished && safetyCount < 200) {
     const rows = Array.from(dialog.querySelectorAll('[data-ad-rendering-role="profile_name"]'));
+    let newItemsInPass = 0;
 
     for (const row of rows) {
-        // --- Name Extraction (User > Group) ---
-        let name = "Unknown";
+        // -- DATA FIELDS --
+        let username = "Unknown";
+        let groupUrl = "";
+        let profileUrl = "";
+
         const headerLinks = Array.from(row.querySelectorAll('a'));
         
         if (headerLinks.length > 0) {
-            name = headerLinks[0].textContent.trim();
+            // First link is User
+            const userLink = headerLinks[0];
+            username = userLink.textContent.trim();
+            profileUrl = userLink.href.split('?')[0];
+
+            // Second link (if exists and different) is Group
             if (headerLinks.length > 1) {
-                const groupName = headerLinks[1].textContent.trim();
-                if (groupName && groupName !== name) {
-                    name = `${name} > ${groupName}`;
+                const potentialGroup = headerLinks[1];
+                if (potentialGroup.textContent.trim() !== username) {
+                    groupUrl = potentialGroup.href.split('?')[0];
                 }
             }
         } else {
             const nameEl = row.querySelector('strong') || row.querySelector('span');
-            if (nameEl) name = nameEl.textContent.trim();
+            if (nameEl) username = nameEl.textContent.trim();
         }
 
-        // Duplicate Check
-        const profileLinkEl = row.closest('a') || row.querySelector('a');
-        const profileHref = profileLinkEl ? profileLinkEl.href.split('?')[0] : '';
-        const uniqueId = name + profileHref;
-        
+        const uniqueId = username + profileUrl;
         if (processedIds.has(uniqueId)) continue;
 
-        // --- Link Finding ---
+        // -- FIND TIMESTAMP LINK --
         let timestampLink = null;
         let parent = row.parentElement;
 
+        // Depth 10 for deep group nesting
         for (let k = 0; k < 10 && parent; k++) {
             const links = Array.from(parent.querySelectorAll('a[href]'));
             const isGenericGroupLink = (href) => href.includes('/groups/') && !href.includes('/posts/') && !href.includes('/permalink/');
@@ -216,13 +343,14 @@ async function runExtractionOnPage(platform) {
             let candidate = links.find(l => {
                 const h = l.href;
                 const isPost = h.includes('/posts/') || h.includes('/permalink/') || h.includes('/photo') || h.includes('/video');
-                return isPost && !h.includes(profileHref);
+                // Ensure it's not the profile link
+                return isPost && !h.includes(profileUrl);
             });
             
             if (!candidate) {
                 candidate = links.find(l => {
                     const aria = l.getAttribute('aria-label');
-                    return aria && /\d{4}/.test(aria) && !l.href.includes(profileHref) && !isGenericGroupLink(l.href);
+                    return aria && /\d{4}/.test(aria) && !l.href.includes(profileUrl) && !isGenericGroupLink(l.href);
                 });
             }
 
@@ -230,7 +358,7 @@ async function runExtractionOnPage(platform) {
                 candidate = links.find(l => 
                     l.href && 
                     l.href.length > 25 && 
-                    !l.href.includes(profileHref) && 
+                    !l.href.includes(profileUrl) && 
                     !isGenericGroupLink(l.href) &&
                     !l.textContent.includes("Comment")
                 );
@@ -251,72 +379,83 @@ async function runExtractionOnPage(platform) {
             await triggerDeepHover(timestampLink);
 
             let attempts = 0;
-            while(!foundTooltipText && attempts < 15) {
+            while(!foundTooltipText && attempts < 20) {
                 await wait(100);
                 attempts++;
             }
 
-            if (foundTooltipText) {
+            let finalTime = foundTooltipText;
+            let isoTime = "";
+            let postUrl = timestampLink.href.split('?')[0];
+
+            if (finalTime) {
                 timestampLink.style.border = "2px solid #0f0";
-                results.push({ name, time: foundTooltipText, url: timestampLink.href });
+                try { isoTime = new Date(finalTime).toISOString(); } catch(e){}
             } else {
                 timestampLink.style.border = "2px solid orange";
-                const fallback = timestampLink.getAttribute('aria-label') || "Hover failed";
-                results.push({ name, time: fallback, url: timestampLink.href });
+                finalTime = timestampLink.getAttribute('aria-label') || "Hover failed";
             }
+
+            results.push({ 
+                username, 
+                time: finalTime, 
+                isoTime, 
+                profileUrl, 
+                groupUrl, 
+                postUrl 
+            });
 
             setTimeout(() => { timestampLink.style.border = originalBorder; }, 500);
         } else {
-            results.push({ name, time: "Hidden/Privacy", url: "" });
+            results.push({ 
+                username, 
+                time: "Hidden/Privacy", 
+                isoTime: "", 
+                profileUrl, 
+                groupUrl, 
+                postUrl: "" 
+            });
         }
 
         processedIds.add(uniqueId);
-        // Small delay so UI doesn't freeze
+        newItemsInPass++;
         await wait(50);
     }
 
-    // --- ENHANCED PERSISTENT SCROLL LOGIC ---
+    // --- SCROLL LOGIC ---
+    if (newItemsInPass === 0) noNewDataCount++;
+    else noNewDataCount = 0;
+
+    const hasPrivacyText = dialog.innerText.includes("Some posts may not appear here");
+
     if (scrollableDiv) {
         const previousHeight = scrollableDiv.scrollHeight;
         
         // Scroll to absolute bottom
         scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
-        
-        // Wait for potential network request
-        await wait(2000);
+        await wait(2000); 
 
-        // Check if height increased
         if (scrollableDiv.scrollHeight > previousHeight) {
             console.log("New content loaded...");
-            continue; // Go back to extracting
+            continue;
         } 
         
-        // If height didn't change, we try 2 more times (Double Tap)
-        // because sometimes the first scroll event is consumed by a spinner
-        console.log("Height didn't change, retrying scroll...");
-        await wait(1500);
-        scrollableDiv.scrollTop = scrollableDiv.scrollHeight; // Force again
-        await wait(1500);
-        
-        if (scrollableDiv.scrollHeight > previousHeight) {
-             console.log("New content loaded on retry...");
-             continue;
-        }
-        
-        // Third and final try
-        console.log("Still no change, final retry...");
+        // Double Tap
         await wait(1500);
         scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
         await wait(1500);
+        
+        if (scrollableDiv.scrollHeight > previousHeight) continue;
 
-        if (scrollableDiv.scrollHeight <= previousHeight) {
-             console.log("Reached end of list.");
-             isScrollingFinished = true;
+        // Final check
+        if (hasPrivacyText || (scrollableDiv.scrollHeight <= previousHeight && noNewDataCount > 1)) {
+            console.log("End of list reached.");
+            isScrollingFinished = true;
         }
     } else {
-        // No scrollable container found, break immediately
         isScrollingFinished = true;
     }
+    safetyCount++;
   }
 
   observer.disconnect();
