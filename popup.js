@@ -238,8 +238,82 @@ async function runExtractionOnPage(platform) {
   }
 
   // --- FACEBOOK LOGIC ---
-  const dialog = document.querySelector('[role="dialog"]');
-  if (!dialog) return [];
+  
+  // ============================================
+  // FIX: Find the SHARES dialog, not Notifications
+  // ============================================
+  const allDialogs = document.querySelectorAll('[role="dialog"]');
+  let dialog = null;
+
+  // Keywords that indicate a shares/reposts dialog
+  const shareKeywords = [
+    'share', 'shares', 'shared', 'repost', 'reposts', 
+    'people shared this', 'shared this post', 'others shared'
+  ];
+  
+  // Keywords that indicate dialogs we should SKIP
+  const skipKeywords = [
+    'notification', 'notifications', 'menu', 'search',
+    'messenger', 'chat', 'message', 'compose'
+  ];
+
+  for (const d of allDialogs) {
+    const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
+    const innerText = (d.innerText || '').substring(0, 1000).toLowerCase();
+    
+    // Skip known non-share dialogs
+    const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
+    if (shouldSkip) continue;
+    
+    // Check if this looks like a shares dialog
+    const isShareDialog = shareKeywords.some(kw => 
+      ariaLabel.includes(kw) || innerText.includes(kw)
+    );
+    
+    if (isShareDialog) {
+      dialog = d;
+      console.log("Found shares dialog via keywords:", ariaLabel || "(no aria-label)");
+      break;
+    }
+  }
+
+  // Fallback: Find dialog with profile_name elements (shares list has these)
+  if (!dialog) {
+    for (const d of allDialogs) {
+      const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
+      const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
+      if (shouldSkip) continue;
+      
+      // Check if this dialog contains share-like content
+      const hasProfileNames = d.querySelectorAll('[data-ad-rendering-role="profile_name"]').length > 0;
+      if (hasProfileNames) {
+        dialog = d;
+        console.log("Found dialog via profile_name elements");
+        break;
+      }
+    }
+  }
+
+  // Last resort: Any dialog that's not in the skip list
+  if (!dialog) {
+    for (const d of allDialogs) {
+      const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
+      const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
+      if (!shouldSkip) {
+        dialog = d;
+        console.log("Using fallback dialog:", ariaLabel || "(no aria-label)");
+        break;
+      }
+    }
+  }
+
+  if (!dialog) {
+    console.log("No suitable dialog found. Available dialogs:");
+    allDialogs.forEach((d, i) => {
+      console.log(`  ${i}: aria-label="${d.getAttribute('aria-label')}"`);
+    });
+    return [];
+  }
 
   // Identify Scroll Container
   let scrollableDiv = Array.from(dialog.querySelectorAll('div')).find(d => {
