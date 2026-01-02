@@ -240,87 +240,174 @@ async function runExtractionOnPage(platform) {
   // --- FACEBOOK LOGIC ---
   
   // ============================================
-  // FIX: Find the SHARES dialog, not Notifications
+  // FIXED: Prioritized dialog detection for "People who shared this"
   // ============================================
   const allDialogs = document.querySelectorAll('[role="dialog"]');
   let dialog = null;
 
-  // Keywords that indicate a shares/reposts dialog
-  const shareKeywords = [
-    'share', 'shares', 'shared', 'repost', 'reposts', 
-    'people shared this', 'shared this post', 'others shared'
-  ];
-  
-  // Keywords that indicate dialogs we should SKIP
-  const skipKeywords = [
-    'notification', 'notifications', 'menu', 'search',
-    'messenger', 'chat', 'message', 'compose'
-  ];
+  // Log all dialogs for debugging
+  console.log("=== SHARE EXTRACTOR - DIALOG DETECTION ===");
+  console.log(`Found ${allDialogs.length} dialogs on page`);
+  allDialogs.forEach((d, i) => {
+    const label = d.getAttribute('aria-label') || '(no label)';
+    const hasProfiles = d.querySelectorAll('[data-ad-rendering-role="profile_name"]').length;
+    const h2Text = d.querySelector('h2')?.textContent || '(no h2)';
+    console.log(`Dialog ${i}: aria-label="${label}" | h2="${h2Text}" | profiles: ${hasProfiles}`);
+  });
 
+  // PRIORITY 1: Exact match for "People who shared this" aria-label
   for (const d of allDialogs) {
     const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
-    const innerText = (d.innerText || '').substring(0, 1000).toLowerCase();
-    
-    // Skip known non-share dialogs
-    const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
-    if (shouldSkip) continue;
-    
-    // Check if this looks like a shares dialog
-    const isShareDialog = shareKeywords.some(kw => 
-      ariaLabel.includes(kw) || innerText.includes(kw)
-    );
-    
-    if (isShareDialog) {
+    if (ariaLabel === 'people who shared this') {
       dialog = d;
-      console.log("Found shares dialog via keywords:", ariaLabel || "(no aria-label)");
+      console.log("✅ EXACT MATCH: Found 'People who shared this' dialog via aria-label");
       break;
     }
   }
 
-  // Fallback: Find dialog with profile_name elements (shares list has these)
+  // PRIORITY 2: Check h2 heading text for exact match
   if (!dialog) {
+    for (const d of allDialogs) {
+      const h2 = d.querySelector('h2');
+      const h2Text = (h2?.textContent || '').toLowerCase().trim();
+      if (h2Text === 'people who shared this' || h2Text.includes('people who shared')) {
+        dialog = d;
+        console.log("✅ H2 EXACT MATCH: Found dialog with h2:", h2Text);
+        break;
+      }
+    }
+  }
+
+  // PRIORITY 3: Check for span with "People who shared this" text
+  if (!dialog) {
+    for (const d of allDialogs) {
+      const spans = d.querySelectorAll('span');
+      for (const span of spans) {
+        const text = (span.textContent || '').toLowerCase().trim();
+        if (text === 'people who shared this') {
+          dialog = d;
+          console.log("✅ SPAN MATCH: Found dialog with span text:", text);
+          break;
+        }
+      }
+      if (dialog) break;
+    }
+  }
+
+  // PRIORITY 4: Partial match in aria-label for shares-related text
+  if (!dialog) {
+    const ariaMatches = ['shared this', 'who shared', 'shares', 'reposts'];
+    for (const d of allDialogs) {
+      const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
+      if (ariaMatches.some(kw => ariaLabel.includes(kw))) {
+        dialog = d;
+        console.log("✅ ARIA PARTIAL MATCH: Found dialog with aria-label:", ariaLabel);
+        break;
+      }
+    }
+  }
+
+  // PRIORITY 5: Dialog with profile_name elements AND "Some posts may not appear" text
+  // This text appears at bottom of shares dialog
+  if (!dialog) {
+    for (const d of allDialogs) {
+      const hasProfileNames = d.querySelectorAll('[data-ad-rendering-role="profile_name"]').length > 0;
+      const innerText = d.innerText || '';
+      const hasPrivacyNote = innerText.includes('Some posts may not appear here');
+      
+      if (hasProfileNames && hasPrivacyNote) {
+        dialog = d;
+        console.log("✅ PRIVACY NOTE MATCH: Found dialog with profile_names + privacy notice");
+        break;
+      }
+    }
+  }
+
+  // PRIORITY 6: Dialog with profile_name elements (likely shares list)
+  if (!dialog) {
+    // Skip dialogs that are clearly not the shares dialog
+    const skipKeywords = [
+      'notification', 'notifications', 'menu', 'search',
+      'messenger', 'chat', 'message', 'compose', 'create', 
+      'story', 'stories', 'reel', 'reels', 'live'
+    ];
+    
     for (const d of allDialogs) {
       const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
       const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
       if (shouldSkip) continue;
       
-      // Check if this dialog contains share-like content
-      const hasProfileNames = d.querySelectorAll('[data-ad-rendering-role="profile_name"]').length > 0;
-      if (hasProfileNames) {
+      const profileCount = d.querySelectorAll('[data-ad-rendering-role="profile_name"]').length;
+      if (profileCount > 0) {
         dialog = d;
-        console.log("Found dialog via profile_name elements");
+        console.log("✅ PROFILE MATCH: Found dialog with", profileCount, "profile_name elements");
         break;
       }
     }
   }
 
-  // Last resort: Any dialog that's not in the skip list
+  // PRIORITY 7: Last resort - any visible dialog not in skip list
   if (!dialog) {
+    const skipKeywords = [
+      'notification', 'notifications', 'menu', 'search',
+      'messenger', 'chat', 'message', 'compose', 'create'
+    ];
+    
     for (const d of allDialogs) {
       const ariaLabel = (d.getAttribute('aria-label') || '').toLowerCase();
       const shouldSkip = skipKeywords.some(kw => ariaLabel.includes(kw));
-      if (!shouldSkip) {
+      
+      // Check if dialog is visible
+      const rect = d.getBoundingClientRect();
+      const isVisible = rect.width > 0 && rect.height > 0;
+      
+      if (!shouldSkip && isVisible) {
         dialog = d;
-        console.log("Using fallback dialog:", ariaLabel || "(no aria-label)");
+        console.log("⚠️ FALLBACK: Using visible dialog:", ariaLabel || "(no aria-label)");
         break;
       }
     }
   }
 
   if (!dialog) {
-    console.log("No suitable dialog found. Available dialogs:");
-    allDialogs.forEach((d, i) => {
-      console.log(`  ${i}: aria-label="${d.getAttribute('aria-label')}"`);
-    });
+    console.error("❌ NO SUITABLE DIALOG FOUND");
+    console.log("Make sure the 'People who shared this' popup is open!");
     return [];
   }
 
-  // Identify Scroll Container
-  let scrollableDiv = Array.from(dialog.querySelectorAll('div')).find(d => {
+  console.log("=== USING DIALOG ===");
+  console.log("aria-label:", dialog.getAttribute('aria-label'));
+  console.log("h2 text:", dialog.querySelector('h2')?.textContent);
+
+  // Identify Scroll Container - look for the scrollable area INSIDE the dialog
+  let scrollableDiv = null;
+  
+  // First, try to find the specific scrollable container in the shares dialog
+  const potentialScrollers = Array.from(dialog.querySelectorAll('div')).filter(d => {
+    const s = window.getComputedStyle(d);
+    const hasScroll = s.overflowY === 'auto' || s.overflowY === 'scroll';
+    const hasHeight = d.scrollHeight > d.clientHeight;
+    return hasScroll && hasHeight;
+  });
+  
+  // Pick the one with the most content (largest scrollHeight)
+  if (potentialScrollers.length > 0) {
+    scrollableDiv = potentialScrollers.reduce((a, b) => 
+      a.scrollHeight > b.scrollHeight ? a : b
+    );
+    console.log("Found scrollable container with height:", scrollableDiv.scrollHeight);
+  }
+  
+  if (!scrollableDiv) {
+    // Fallback: any div with overflow auto/scroll
+    scrollableDiv = Array.from(dialog.querySelectorAll('div')).find(d => {
       const s = window.getComputedStyle(d);
       return s.overflowY === 'auto' || s.overflowY === 'scroll';
-  });
+    });
+  }
+  
   if (!scrollableDiv) scrollableDiv = dialog;
+  console.log("Scroll container:", scrollableDiv.className.substring(0, 50) + "...");
 
   // 1. Setup Tooltip Observer
   let foundTooltipText = null;
@@ -532,6 +619,137 @@ async function runExtractionOnPage(platform) {
     safetyCount++;
   }
 
+  // Wait for any final content to load after scrolling ends
+  await wait(1500);
+  
+  // One more scroll to absolute bottom to ensure all content is visible
+  if (scrollableDiv) {
+    scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
+    await wait(1000);
+  }
+  
+  // ============================================
+  // FINAL PASS: Extract any remaining profiles after scroll ends
+  // ============================================
+  console.log("Running final extraction pass...");
+  const finalRows = Array.from(dialog.querySelectorAll('[data-ad-rendering-role="profile_name"]'));
+  
+  for (const row of finalRows) {
+    let username = "Unknown";
+    let groupUrl = "";
+    let profileUrl = "";
+
+    const headerLinks = Array.from(row.querySelectorAll('a'));
+    
+    if (headerLinks.length > 0) {
+      const userLink = headerLinks[0];
+      username = userLink.textContent.trim();
+      profileUrl = userLink.href.split('?')[0];
+
+      if (headerLinks.length > 1) {
+        const potentialGroup = headerLinks[1];
+        if (potentialGroup.textContent.trim() !== username) {
+          groupUrl = potentialGroup.href.split('?')[0];
+        }
+      }
+    } else {
+      const nameEl = row.querySelector('strong') || row.querySelector('span');
+      if (nameEl) username = nameEl.textContent.trim();
+    }
+
+    const uniqueId = username + profileUrl;
+    if (processedIds.has(uniqueId)) continue;
+
+    // Find timestamp link
+    let timestampLink = null;
+    let parent = row.parentElement;
+
+    for (let k = 0; k < 10 && parent; k++) {
+      const links = Array.from(parent.querySelectorAll('a[href]'));
+      const isGenericGroupLink = (href) => href.includes('/groups/') && !href.includes('/posts/') && !href.includes('/permalink/');
+
+      let candidate = links.find(l => {
+        const h = l.href;
+        const isPost = h.includes('/posts/') || h.includes('/permalink/') || h.includes('/photo') || h.includes('/video');
+        return isPost && !h.includes(profileUrl);
+      });
+      
+      if (!candidate) {
+        candidate = links.find(l => {
+          const aria = l.getAttribute('aria-label');
+          return aria && /\d{4}/.test(aria) && !l.href.includes(profileUrl) && !isGenericGroupLink(l.href);
+        });
+      }
+
+      if (!candidate) {
+        candidate = links.find(l => 
+          l.href && 
+          l.href.length > 25 && 
+          !l.href.includes(profileUrl) && 
+          !isGenericGroupLink(l.href) &&
+          !l.textContent.includes("Comment")
+        );
+      }
+
+      if (candidate) {
+        timestampLink = candidate;
+        break;
+      }
+      parent = parent.parentElement;
+    }
+
+    if (timestampLink) {
+      foundTooltipText = null;
+      const originalBorder = timestampLink.style.border;
+      timestampLink.style.border = "2px solid blue";
+
+      await triggerDeepHover(timestampLink);
+
+      let attempts = 0;
+      while(!foundTooltipText && attempts < 20) {
+        await wait(100);
+        attempts++;
+      }
+
+      let finalTime = foundTooltipText;
+      let isoTime = "";
+      let postUrl = timestampLink.href.split('?')[0];
+
+      if (finalTime) {
+        timestampLink.style.border = "2px solid #0f0";
+        try { isoTime = new Date(finalTime).toISOString(); } catch(e){}
+      } else {
+        timestampLink.style.border = "2px solid orange";
+        finalTime = timestampLink.getAttribute('aria-label') || "Hover failed";
+      }
+
+      results.push({ 
+        username, 
+        time: finalTime, 
+        isoTime, 
+        profileUrl, 
+        groupUrl, 
+        postUrl 
+      });
+
+      setTimeout(() => { timestampLink.style.border = originalBorder; }, 500);
+    } else {
+      results.push({ 
+        username, 
+        time: "Hidden/Privacy", 
+        isoTime: "", 
+        profileUrl, 
+        groupUrl, 
+        postUrl: "" 
+      });
+    }
+
+    processedIds.add(uniqueId);
+    console.log("Final pass found:", username);
+    await wait(50);
+  }
+
   observer.disconnect();
+  console.log(`=== EXTRACTION COMPLETE: ${results.length} shares found ===`);
   return results;
 }
