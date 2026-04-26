@@ -1,18 +1,272 @@
 // popup.js
 
+const POPUP_BUILD_ID = '2026-03-13-01';
+
+const STORAGE_KEY_EXTRACTED = 'sse_extractedData';
+const STORAGE_KEY_SAVED_AT = 'sse_savedAt';
+
+function storageGet(keys) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(keys, (res) => resolve(res || {}));
+    } catch {
+      resolve({});
+    }
+  });
+}
+
+function storageSet(obj) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set(obj, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function storageRemove(keys) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.remove(keys, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 let extractedData = {
   facebook: [],
   x: []
 };
 
+let livePollTimer = null;
+
+function stopLivePolling() {
+  if (livePollTimer) {
+    clearInterval(livePollTimer);
+    livePollTimer = null;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  const uiLog = (message) => {
+    try {
+      const el = document.getElementById('debugLog');
+      if (!el) return;
+      const line = `[${new Date().toISOString()}] ${message}`;
+      if (!el.textContent || el.textContent.trim() === '(no logs yet)') {
+        el.textContent = line;
+      } else {
+        el.textContent += `\n${line}`;
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  try {
+    const jsIndicator = document.getElementById('jsIndicator');
+    if (jsIndicator) jsIndicator.textContent = `JS: loaded (${POPUP_BUILD_ID})`;
+  } catch {
+    // ignore
+  }
+
+  uiLog(`Popup loaded (build ${POPUP_BUILD_ID})`);
+
+  // Surface popup errors inside the UI (otherwise it looks like "nothing happens").
+  try {
+    window.addEventListener('error', (e) => {
+      const message = e?.message || 'Unknown error';
+      uiLog(`window.error: ${message}`);
+      showStatus(`Popup error: ${message}`, 'error');
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const reason = e?.reason;
+      const message = (reason && (reason.message || String(reason))) || 'Unknown promise rejection';
+      uiLog(`unhandledrejection: ${message}`);
+      showStatus(`Popup error: ${message}`, 'error');
+    });
+  } catch {
+    // ignore
+  }
+
   const extractBtn = document.getElementById('extractBtn');
   const clearBtn = document.getElementById('clearBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const xMaxQuoteDetailsEl = document.getElementById('xMaxQuoteDetails');
+  const xMaxQuotesMinutesEl = document.getElementById('xMaxQuotesMinutes');
+  const xMaxRetweetsMinutesEl = document.getElementById('xMaxRetweetsMinutes');
   const statusEl = document.getElementById('status');
   const resultsEl = document.getElementById('results');
   const statsEl = document.getElementById('stats');
   const tabsEl = document.getElementById('tabs');
   const exportOptionsEl = document.getElementById('exportOptions');
+
+  if (!extractBtn || !clearBtn || !resetBtn || !statusEl || !resultsEl) {
+    uiLog('Popup wiring error: missing required DOM nodes');
+    return;
+  }
+
+  const setDebugLogText = (text) => {
+    try {
+      const el = document.getElementById('debugLog');
+      if (!el) return;
+      el.textContent = text || '(no logs yet)';
+    } catch {
+      // ignore
+    }
+  };
+
+  const renderLiveState = (job, state) => {
+    if (!job) return;
+    const status = job.status || state?.status || 'idle';
+
+    const quotes = state?.data?.quotes?.length || 0;
+    const quoteDetails = state?.data?.quoteDetails?.length || 0;
+    const reposts = state?.data?.reposts?.length || 0;
+
+    const lastLog = Array.isArray(state?.log) && state.log.length ? state.log[state.log.length - 1].message : '';
+    if (status === 'running') {
+      showStatus(`⏳ Running… quotes=${quotes}, quote-details=${quoteDetails}, retweeters=${reposts}${lastLog ? ` • ${lastLog}` : ''}`, 'info');
+    } else if (status === 'done') {
+      showStatus(`✅ Done. quotes=${quotes}, quote-details=${quoteDetails}, retweeters=${reposts}`, 'success');
+    } else if (status === 'error') {
+      showStatus(`Error: ${job.error || lastLog || 'Unknown error'}`, 'error');
+    } else if (status === 'cancelled') {
+      showStatus('Cancelled.', 'error');
+    }
+
+    if (Array.isArray(state?.log) && state.log.length) {
+      const lines = state.log.slice(-250).map((l) => `[${l.at}] ${l.message}`).join('\n');
+      setDebugLogText(lines);
+    }
+  };
+
+  const refreshFromBackground = async () => {
+    const jobRes = await storageGet(['sse_job']);
+    const job = jobRes?.sse_job || null;
+    if (!job?.tabId) return;
+
+    // Show the latest persisted state immediately (works even if popup was closed).
+    const persisted = await storageGet([`sse_state_${job.tabId}`]);
+    const persistedState = persisted?.[`sse_state_${job.tabId}`];
+    if (persistedState) renderLiveState(job, persistedState);
+
+    // If job finished, load the persisted results.
+    if (job.status === 'done') {
+      const saved = await storageGet([STORAGE_KEY_EXTRACTED, STORAGE_KEY_SAVED_AT]);
+      const restored = saved?.[STORAGE_KEY_EXTRACTED];
+      if (restored && typeof restored === 'object') {
+        const fb = Array.isArray(restored.facebook) ? restored.facebook : [];
+        let xRows = Array.isArray(restored.x) ? restored.x : [];
+        if (xRows.length === 1 && xRows[0]?.__workflow === 'x' && xRows[0]?.data) {
+          xRows = flattenXWorkflowData(xRows[0].data);
+        }
+        extractedData = { facebook: fb, x: xRows };
+        updateStats();
+        renderResults('all');
+        if (statsEl) statsEl.style.display = 'flex';
+        if (tabsEl) tabsEl.style.display = 'flex';
+        if (exportOptionsEl) exportOptionsEl.style.display = 'flex';
+      }
+    }
+
+    stopLivePolling();
+    if (job.status === 'running') {
+      livePollTimer = setInterval(async () => {
+        try {
+          const st = await chrome.runtime.sendMessage({ type: 'x_get_state', tabId: job.tabId });
+          if (st?.ok && st.state) {
+            // Refresh job snapshot too (it contains status/error).
+            const jobNow = (await storageGet(['sse_job']))?.sse_job || job;
+            renderLiveState(jobNow, st.state);
+
+            if (st.state.status === 'done' || st.state.status === 'error' || st.state.status === 'cancelled') {
+              stopLivePolling();
+              await refreshFromBackground();
+            }
+          }
+        } catch (e) {
+          uiLog(`Live poll error: ${e?.message || String(e)}`);
+        }
+      }, 1200);
+    }
+  };
+
+  const clampInt = (v, { min = 0, max = 9999 } = {}) => {
+    const n = Number.parseInt(String(v ?? '').trim(), 10);
+    if (!Number.isFinite(n)) return min;
+    return Math.max(min, Math.min(max, n));
+  };
+
+  const readXOptionsFromUi = () => {
+    const maxQuoteDetails = clampInt(xMaxQuoteDetailsEl?.value, { min: 0, max: 5000 });
+    const maxQuotesMinutes = clampInt(xMaxQuotesMinutesEl?.value, { min: 1, max: 20 });
+    const maxRetweetsMinutes = clampInt(xMaxRetweetsMinutesEl?.value, { min: 1, max: 30 });
+    return {
+      maxQuoteDetails,
+      maxQuotesDurationMs: maxQuotesMinutes * 60 * 1000,
+      maxRetweetsDurationMs: maxRetweetsMinutes * 60 * 1000,
+    };
+  };
+
+  const persistXOptions = async () => {
+    try {
+      await storageSet({ sse_x_options: readXOptionsFromUi() });
+    } catch {
+      // ignore
+    }
+  };
+
+  const restoreXOptions = async () => {
+    try {
+      const saved = await storageGet(['sse_x_options']);
+      const opts = saved?.sse_x_options;
+      if (!opts) return;
+      if (xMaxQuoteDetailsEl) xMaxQuoteDetailsEl.value = String(clampInt(opts.maxQuoteDetails, { min: 0, max: 5000 }));
+      if (xMaxQuotesMinutesEl) xMaxQuotesMinutesEl.value = String(clampInt(Math.round((opts.maxQuotesDurationMs || 0) / 60000) || 1, { min: 1, max: 20 }));
+      if (xMaxRetweetsMinutesEl) xMaxRetweetsMinutesEl.value = String(clampInt(Math.round((opts.maxRetweetsDurationMs || 0) / 60000) || 1, { min: 1, max: 30 }));
+    } catch {
+      // ignore
+    }
+  };
+
+  if (xMaxQuoteDetailsEl) xMaxQuoteDetailsEl.addEventListener('change', persistXOptions);
+  if (xMaxQuotesMinutesEl) xMaxQuotesMinutesEl.addEventListener('change', persistXOptions);
+  if (xMaxRetweetsMinutesEl) xMaxRetweetsMinutesEl.addEventListener('change', persistXOptions);
+
+  // Restore persisted results so popup is effectively stateful.
+  (async () => {
+    const saved = await storageGet([STORAGE_KEY_EXTRACTED, STORAGE_KEY_SAVED_AT]);
+    const restored = saved?.[STORAGE_KEY_EXTRACTED];
+    if (restored && typeof restored === 'object') {
+      const fb = Array.isArray(restored.facebook) ? restored.facebook : [];
+
+      // X may be stored either as flattened rows or as a raw workflow wrapper.
+      let xRows = Array.isArray(restored.x) ? restored.x : [];
+      if (xRows.length === 1 && xRows[0]?.__workflow === 'x' && xRows[0]?.data) {
+        xRows = flattenXWorkflowData(xRows[0].data);
+      }
+
+      extractedData = { facebook: fb, x: xRows };
+
+      const total = extractedData.facebook.length + extractedData.x.length;
+      if (total > 0) {
+        uiLog(`Restored ${total} saved results (${saved?.[STORAGE_KEY_SAVED_AT] || 'unknown time'})`);
+        updateStats();
+        renderResults('all');
+        if (statsEl) statsEl.style.display = 'flex';
+        if (tabsEl) tabsEl.style.display = 'flex';
+        if (exportOptionsEl) exportOptionsEl.style.display = 'flex';
+      }
+    }
+
+    await restoreXOptions();
+
+    // Always show background progress/logs (even if no results yet).
+    await refreshFromBackground();
+  })();
 
   // Tab switching
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -25,6 +279,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Extract button
   extractBtn.addEventListener('click', async () => {
+    uiLog('Extract clicked');
     extractBtn.disabled = true;
     showStatus('Injecting script... DO NOT CLOSE THIS POPUP.', 'info');
 
@@ -33,34 +288,87 @@ document.addEventListener('DOMContentLoaded', () => {
       
       if (!tab.url) throw new Error("Cannot access this page");
 
+      uiLog(`Active tab: ${tab.url}`);
+
       const isFacebook = tab.url.includes('facebook.com');
       const isX = tab.url.includes('twitter.com') || tab.url.includes('x.com');
 
       if (!isFacebook && !isX) throw new Error("Please navigate to Facebook or X/Twitter");
 
-      showStatus('Extracting... Auto-scrolling and hovering. This takes time to be accurate.', 'info');
+      let data;
 
-      // Execute the extraction script
-      const results = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: runExtractionOnPage,
-        args: [isFacebook ? 'facebook' : 'x']
-      });
+      if (isFacebook) {
+        uiLog('Platform: Facebook');
+        showStatus('Extracting Facebook shares... Auto-scrolling and hovering. This takes time.', 'info');
 
-      if (!results || !results[0] || !results[0].result) {
-        throw new Error("Script returned no data. Ensure the dialog is open.");
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: runExtractionOnPage,
+          args: ['facebook']
+        });
+
+        if (!results || !results[0]) {
+          throw new Error('No response from page script. Ensure the shares dialog is open.');
+        }
+        if (results[0].error) {
+          const message = results[0].error.message || String(results[0].error);
+          throw new Error(`Facebook extraction failed: ${message}`);
+        }
+        data = results[0].result;
+      } else {
+        uiLog('Platform: X/Twitter');
+        showStatus('🤖 Starting X/Twitter workflow in background (you can close the popup)...', 'info');
+
+        const tweetUrl = tab.url.split('?')[0];
+        const xOpts = readXOptionsFromUi();
+        uiLog(`X options: maxQuoteDetails=${xOpts.maxQuoteDetails}, maxQuotesMinutes=${Math.round(xOpts.maxQuotesDurationMs / 60000)}, maxRetweetsMinutes=${Math.round(xOpts.maxRetweetsDurationMs / 60000)}`);
+
+        const workflowOptions = {
+          maxQuoteDetails: xOpts.maxQuoteDetails,
+          maxQuotesDurationMs: xOpts.maxQuotesDurationMs,
+          maxRetweetsDurationMs: xOpts.maxRetweetsDurationMs,
+          scroll: { maxScrolls: 18, settleLoops: 3, delayMs: 1700 }
+        };
+
+        // Start async workflow in background. Do not wait for completion.
+        const start = await chrome.runtime.sendMessage({
+          type: 'x_start_workflow',
+          tabId: tab.id,
+          tweetUrl,
+          options: workflowOptions
+        });
+
+        if (!start?.ok) throw new Error(start?.error || 'Failed to start X workflow');
+
+        // Immediately switch UI into live mode; do not block waiting for completion.
+        await refreshFromBackground();
+        data = [];
       }
 
-      const data = results[0].result;
+      if (!Array.isArray(data)) {
+        throw new Error(`Unexpected extraction result type: ${typeof data}`);
+      }
       
       if (data.length === 0) {
-        showStatus('No share data found. Ensure the shares dialog is open.', 'error');
+        if (isFacebook) {
+          showStatus('No share data found. Ensure the shares dialog is open.', 'error');
+          extractBtn.disabled = false;
+          return;
+        }
+        // X: background workflow is running; live status/logs handle UX.
         extractBtn.disabled = false;
         return;
       }
 
       if (isFacebook) extractedData.facebook = data;
       else extractedData.x = data;
+
+      // Persist results so they survive popup close/tab switching.
+      // (X background also persists; this keeps the shape consistent for restore.)
+      await storageSet({
+        [STORAGE_KEY_EXTRACTED]: extractedData,
+        [STORAGE_KEY_SAVED_AT]: new Date().toISOString(),
+      });
       
       updateStats();
       renderResults('all');
@@ -73,6 +381,7 @@ document.addEventListener('DOMContentLoaded', () => {
       
     } catch (error) {
       console.error('Extraction error:', error);
+      uiLog(`Catch: ${error?.message || String(error)}`);
       showStatus(`Error: ${error.message}`, 'error');
     }
 
@@ -80,8 +389,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Clear button
-  clearBtn.addEventListener('click', () => {
+  clearBtn.addEventListener('click', async () => {
     extractedData = { facebook: [], x: [] };
+    await storageSet({
+      [STORAGE_KEY_EXTRACTED]: extractedData,
+      [STORAGE_KEY_SAVED_AT]: new Date().toISOString(),
+    });
     updateStats();
     renderResults('all');
     if (statsEl) statsEl.style.display = 'none';
@@ -90,12 +403,33 @@ document.addEventListener('DOMContentLoaded', () => {
     showStatus('', 'info');
   });
 
+  // Reset button: clears persisted + in-memory data.
+  resetBtn.addEventListener('click', async () => {
+    stopLivePolling();
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) await chrome.runtime.sendMessage({ type: 'sse_reset_all', tabId: tab.id });
+    } catch {
+      // ignore
+    }
+    await storageRemove([STORAGE_KEY_EXTRACTED, STORAGE_KEY_SAVED_AT]);
+    extractedData = { facebook: [], x: [] };
+    updateStats();
+    renderResults('all');
+    if (statsEl) statsEl.style.display = 'none';
+    if (tabsEl) tabsEl.style.display = 'none';
+    if (exportOptionsEl) exportOptionsEl.style.display = 'none';
+    showStatus('Reset complete. Ready for a fresh run.', 'success');
+    setTimeout(() => showStatus('', 'info'), 2000);
+  });
+
   // --- EXPORT HANDLERS ---
 
   // Export JSON
   document.getElementById('exportJSON').addEventListener('click', () => {
     const all = [...extractedData.facebook, ...extractedData.x];
-    downloadFile(JSON.stringify(all, null, 2), 'shares.json', 'application/json');
+    const rows = all.map(toExcelRow);
+    downloadFile(JSON.stringify(rows, null, 2), 'shares.json', 'application/json');
   });
 
   // Export CSV (Comma Separated for File)
@@ -106,18 +440,399 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Copy to Clipboard (Tab Separated for Paste)
-  document.getElementById('copyAll').addEventListener('click', async () => {
-    const all = [...extractedData.facebook, ...extractedData.x];
-    const tsvContent = formatData(all, false, "\t"); // Use TAB for clipboard columns
+  const getMainPostRows = () => {
+    // Main post is an X-only concept in this extension.
+    const x = Array.isArray(extractedData?.x) ? extractedData.x : [];
+    return x.filter(r => (r?.type || r?.kind) === 'MAIN_POST');
+  };
+
+  const getOtherRows = () => {
+    const fb = Array.isArray(extractedData?.facebook) ? extractedData.facebook : [];
+    const x = Array.isArray(extractedData?.x) ? extractedData.x : [];
+    const xOthers = x.filter(r => (r?.type || r?.kind) !== 'MAIN_POST');
+    return [...fb, ...xOthers];
+  };
+
+  document.getElementById('copyMain')?.addEventListener('click', async () => {
+    const main = getMainPostRows();
+    if (!main.length) {
+      showStatus('No MAIN_POST found to copy.', 'error');
+      setTimeout(() => showStatus('', 'info'), 2500);
+      return;
+    }
+    const tsvContent = formatData(main, false, "\t"); // Use TAB for clipboard columns
     await navigator.clipboard.writeText(tsvContent);
-    showStatus('Data copied! Ready to paste into Excel/Sheets.', 'success');
+    showStatus('Main post copied!', 'success');
+    setTimeout(() => showStatus('', 'info'), 2500);
+  });
+
+  document.getElementById('copyOthers')?.addEventListener('click', async () => {
+    const others = getOtherRows();
+    if (!others.length) {
+      showStatus('No other rows found to copy.', 'error');
+      setTimeout(() => showStatus('', 'info'), 2500);
+      return;
+    }
+    const tsvContent = formatData(others, false, "\t"); // Use TAB for clipboard columns
+    await navigator.clipboard.writeText(tsvContent);
+    showStatus('Other rows copied! Ready to paste into Excel/Sheets.', 'success');
     setTimeout(() => showStatus('', 'info'), 3000);
   });
 });
 
+function toExcelRow(item) {
+  const username = item?.username ? String(item.username) : '';
+  const viewCount = item?.viewCount ? String(item.viewCount) : '';
+
+  const userIdLink = item?.profileUrl ? String(item.profileUrl) : '';
+
+  // Prefer an actual post URL when present; for repost rows we may only have a profile URL.
+  // If workflow attached a mainTweetUrl/parentTweetUrl, prefer that for post link.
+  const postLink =
+    (item?.tweetUrl ? String(item.tweetUrl) : '') ||
+    (item?.type === 'REPOST' && item?.mainTweetUrl ? String(item.mainTweetUrl) : '') ||
+    (item?.type === 'REPOST' && item?.parentTweetUrl ? String(item.parentTweetUrl) : '') ||
+    (item?.postUrl ? String(item.postUrl) : '');
+
+  // Export Time should be ISO when available (e.g., 2024-08-05T18:00:00.000Z).
+  // UI can still show a human-readable string via `item.time`.
+  const isoTime =
+    (item?.isoTime ? String(item.isoTime) : '') ||
+    (item?.timestamp ? String(item.timestamp) : '') ||
+    (item?.iso_time ? String(item.iso_time) : '');
+
+  const time = isoTime || (item?.time ? String(item.time) : '');
+
+  return {
+    username,
+    viewCount,
+    userIdLink,
+    postLink,
+    time,
+  };
+}
+
+function flattenXWorkflowData(data) {
+  if (!data) return [];
+  const out = [];
+
+  const mainTweetUrl = data?.main?.tweetUrl || data?.main?.postUrl || null;
+
+  const pushNormalized = (item) => {
+    const normalized = normalizeXItemForUiAndExport(
+      mainTweetUrl ? { ...item, mainTweetUrl } : item
+    );
+    if (normalized) out.push(normalized);
+  };
+
+  // Merge QUOTE_DETAIL into QUOTE by tweetUrl to avoid duplicates.
+  const quotes = Array.isArray(data.quotes) ? data.quotes : [];
+  const quoteDetails = Array.isArray(data.quoteDetails) ? data.quoteDetails : [];
+  const detailByUrl = new Map();
+  for (const d of quoteDetails) {
+    const url = d?.tweetUrl;
+    if (url && !detailByUrl.has(url)) detailByUrl.set(url, d);
+  }
+  const mergedQuotes = quotes.map((q) => {
+    const d = q?.tweetUrl ? detailByUrl.get(q.tweetUrl) : null;
+    if (!d) return q;
+    // Prefer details for counts/views/text if present, keep quote timestamp.
+    return {
+      ...d,
+      ...q,
+      kind: 'QUOTE',
+    };
+  });
+
+  if (data.main) pushNormalized(data.main);
+  mergedQuotes.forEach(pushNormalized);
+  // Only include quoteDetails that weren't present in quotes list.
+  for (const d of quoteDetails) {
+    if (d?.tweetUrl && quotes.some(q => q?.tweetUrl === d.tweetUrl)) continue;
+    pushNormalized(d);
+  }
+  if (Array.isArray(data.reposts)) data.reposts.forEach(pushNormalized);
+
+  // Final dedupe for safety (by postUrl if present, else by profileUrl+type+username).
+  const seen = new Set();
+  const deduped = [];
+  for (const item of out) {
+    const key = item?.postUrl ? `url:${item.postUrl}` : `fallback:${item?.type}:${item?.profileUrl}:${item?.username}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
+function normalizeXItemForUiAndExport(item) {
+  if (!item || typeof item !== 'object') return null;
+
+  const type = item.type || item.kind || null;
+  const tweetUrl = item.tweetUrl || item.postUrl || null;
+  const profileUrl = item.profileUrl || null;
+  const timestamp = item.timestamp || item.isoTime || null;
+  const timestampText = item.timestampText || null;
+  const viewCount = item.viewCount ?? null;
+
+  // For the existing UI/export pipeline, we always provide:
+  // username, time, isoTime, profileUrl, groupUrl, postUrl
+  const username = item.username || (item.handle ? String(item.handle) : '') || '';
+  const displayName = item.displayName || '';
+
+  // Prefer tweet link for tweet/quote items; profile link for reposters.
+  const bestLink =
+    (type === 'REPOST' ? profileUrl : tweetUrl) ||
+    tweetUrl ||
+    profileUrl ||
+    '';
+
+  const timeText =
+    timestampText ||
+    timestamp ||
+    item.note ||
+    (type === 'REPOST' ? 'N/A (no repost timestamps on X retweeters list)' : 'Unknown');
+
+  // Hard rule: retweeter rows do NOT have views or timestamps.
+  // X/Twitter retweeters list does not provide these, so showing them would be misleading.
+  const isRepost = type === 'REPOST';
+
+  return {
+    // Used by some Twitter renderers in older iterations
+    type: type || 'X_ITEM',
+    // Keep original fields for debugging
+    ...item,
+
+    // Canonical fields used by existing UI/export
+    username: displayName && username ? `${displayName} ${username}` : (displayName || username || 'Unknown'),
+    time: isRepost ? (item.note || 'N/A (no repost timestamps on X retweeters list)') : timeText,
+    isoTime: isRepost ? '' : (timestamp || ''),
+    viewCount: isRepost ? '' : (viewCount || ''),
+    profileUrl: profileUrl || '',
+    groupUrl: '',
+    postUrl: bestLink || ''
+  };
+}
+
+// ======================================================
+// X/TWITTER EXTRACTION ENGINE (Injected into Page)
+// NOTE: Must be self-contained for chrome.scripting.executeScript.
+// ======================================================
+async function runTwitterAutomation() {
+  const results = [];
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  const log = (msg) => {
+    console.log(`[TWITTER] ${msg}`);
+    return msg;
+  };
+
+  const autoScrollToBottom = async () => {
+    let lastHeight = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
+    let noChangeCount = 0;
+    const maxScrolls = 16;
+    let scrollCount = 0;
+
+    while (scrollCount < maxScrolls && noChangeCount < 3) {
+      const height = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
+      window.scrollTo(0, height);
+      await wait(1600);
+
+      const newHeight = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
+      if (newHeight === lastHeight) noChangeCount++;
+      else noChangeCount = 0;
+      lastHeight = newHeight;
+      scrollCount++;
+    }
+
+    window.scrollTo(0, 0);
+    await wait(250);
+  };
+
+  const extractMainPostData = () => {
+    const mainTweet = document.querySelector('article[data-testid="tweet"]');
+    if (!mainTweet) return null;
+
+    const data = {
+      type: 'MAIN_POST',
+      timestamp: null,
+      timestampText: null,
+      viewCount: null,
+      repostCount: null,
+      likeCount: null,
+      replyCount: null,
+      username: null,
+      displayName: null,
+      tweetText: null,
+      tweetUrl: window.location.href.split('?')[0],
+      profileUrl: null
+    };
+
+    const time = mainTweet.querySelector('time');
+    if (time) {
+      data.timestamp = time.getAttribute('datetime');
+      data.timestampText = time.textContent.trim();
+    }
+
+    const userName = mainTweet.querySelector('[data-testid="User-Name"]');
+    if (userName) {
+      const links = userName.querySelectorAll('a');
+      if (links[0]) {
+        data.displayName = links[0].textContent.trim();
+        data.profileUrl = links[0].href;
+      }
+      if (links[1]) {
+        data.username = links[1].textContent.trim();
+      }
+    }
+
+    const text = mainTweet.querySelector('[data-testid="tweetText"]');
+    if (text) data.tweetText = text.textContent.trim();
+
+    const allText = mainTweet.innerText.toLowerCase();
+    const viewMatch = allText.match(/(\d+[\d,\.]*(?:[km])?)\s*views?/i);
+    if (viewMatch) data.viewCount = viewMatch[1];
+
+    const repostBtn = mainTweet.querySelector('[data-testid="retweet"]');
+    if (repostBtn) {
+      const aria = repostBtn.getAttribute('aria-label');
+      const match = aria?.match(/^(\d+[\d,\.]*(?:[km])?)/i);
+      if (match) data.repostCount = match[1];
+    }
+
+    const likeBtn = mainTweet.querySelector('[data-testid="like"]') || mainTweet.querySelector('[data-testid="unlike"]');
+    if (likeBtn) {
+      const aria = likeBtn.getAttribute('aria-label');
+      const match = aria?.match(/^(\d+[\d,\.]*(?:[km])?)/i);
+      if (match) data.likeCount = match[1];
+    }
+
+    const replyBtn = mainTweet.querySelector('[data-testid="reply"]');
+    if (replyBtn) {
+      const aria = replyBtn.getAttribute('aria-label');
+      const match = aria?.match(/^(\d+[\d,\.]*(?:[km])?)/i);
+      if (match) data.replyCount = match[1];
+    }
+
+    return data;
+  };
+
+  const extractAllQuotes = () => {
+    const quoteResults = [];
+    const tweets = document.querySelectorAll('article[data-testid="tweet"]');
+    tweets.forEach((tweet, index) => {
+      const data = {
+        type: 'QUOTE',
+        index,
+        timestamp: null,
+        timestampText: null,
+        username: null,
+        displayName: null,
+        tweetText: null,
+        tweetUrl: null,
+        profileUrl: null
+      };
+
+      const time = tweet.querySelector('time');
+      if (time) {
+        data.timestamp = time.getAttribute('datetime');
+        data.timestampText = time.textContent.trim();
+      }
+
+      const userName = tweet.querySelector('[data-testid="User-Name"]');
+      if (userName) {
+        const links = userName.querySelectorAll('a');
+        if (links[0]) {
+          data.displayName = links[0].textContent.trim();
+          data.profileUrl = links[0].href;
+        }
+        if (links[1]) data.username = links[1].textContent.trim();
+      }
+
+      const text = tweet.querySelector('[data-testid="tweetText"]');
+      if (text) data.tweetText = text.textContent.trim();
+
+      const link = tweet.querySelector('a[href*="/status/"]');
+      if (link) data.tweetUrl = link.href.split('?')[0];
+
+      if (data.username || data.displayName) quoteResults.push(data);
+    });
+    return quoteResults;
+  };
+
+  const extractAllReposts = () => {
+    const repostResults = [];
+    const userCells = document.querySelectorAll('[data-testid="UserCell"]');
+    userCells.forEach((cell, index) => {
+      const data = {
+        type: 'REPOST',
+        index,
+        timestamp: 'N/A (X/Twitter does not provide repost timestamps in the retweeters list DOM)',
+        username: null,
+        displayName: null,
+        profileUrl: null
+      };
+
+      const avatar = cell.querySelector('[data-testid^="UserAvatar-Container-"]');
+      if (avatar) {
+        const testId = avatar.getAttribute('data-testid');
+        const match = testId?.match(/UserAvatar-Container-(.+)/);
+        if (match) {
+          data.username = '@' + match[1];
+          data.profileUrl = `https://x.com/${match[1]}`;
+        }
+      }
+
+      const spans = cell.querySelectorAll('span');
+      for (const span of spans) {
+        const text = span.textContent.trim();
+        if (text && !text.startsWith('@') && text.length > 0 && text.length < 100) {
+          data.displayName = text;
+          break;
+        }
+      }
+
+      if (data.username) repostResults.push(data);
+    });
+    return repostResults;
+  };
+
+  log('=== START ===');
+  const url = new URL(window.location.href);
+  const host = (url.hostname || '').toLowerCase();
+  const isXHost = host === 'x.com' || host.endsWith('.x.com');
+  const isTwitterHost = host === 'twitter.com' || host.endsWith('.twitter.com');
+  if (!isXHost && !isTwitterHost) throw new Error('Not on X/Twitter');
+
+  const path = url.pathname || '';
+  const isTweetLikePath = /\/status\/\d+/.test(path) || /\/i\/(web\/)?status\/\d+/.test(path);
+  if (!isTweetLikePath) throw new Error('Open a tweet URL (must include /status/<id>)');
+
+  const isQuotesPage = path.includes('/quotes');
+  const isRepostsPage = path.includes('/retweets') || path.includes('/retweeters');
+
+  if (isQuotesPage) {
+    await autoScrollToBottom();
+    await wait(800);
+    results.push(...extractAllQuotes());
+    return results;
+  }
+
+  if (isRepostsPage) {
+    await autoScrollToBottom();
+    await wait(800);
+    results.push(...extractAllReposts());
+    return results;
+  }
+
+  const main = extractMainPostData();
+  if (!main) throw new Error('Could not find tweet article (not loaded or blocked by login)');
+  results.push(main);
+  return results;
+}
+
 // Data Formatter (Supports CSV and TSV)
 function formatData(data, includeHeader, delimiter) {
-  const columns = ['Username', 'Time', 'iso_time', 'profile_link', 'group_link', 'post_link'];
+  const columns = ['Username', 'View Count', 'User ID Link', 'Post Link', 'Time'];
   
   let output = "";
   if (includeHeader) {
@@ -135,13 +850,14 @@ function formatData(data, includeHeader, delimiter) {
       return s;
     };
 
+    const excelRow = toExcelRow(row);
+
     return [
-      sanitize(row.username),
-      sanitize(row.time),
-      sanitize(row.isoTime),
-      sanitize(row.profileUrl),
-      sanitize(row.groupUrl),
-      sanitize(row.postUrl)
+      sanitize(excelRow.username),
+      sanitize(excelRow.viewCount),
+      sanitize(excelRow.userIdLink),
+      sanitize(excelRow.postLink),
+      sanitize(excelRow.time)
     ].join(delimiter);
   }).join("\n");
 
@@ -183,23 +899,50 @@ function updateStats() {
 function renderResults(filter) {
   const resultsEl = document.getElementById('results');
   let data = [];
-  
+
   if (!filter || filter === 'all' || filter === 'facebook') data = data.concat(extractedData.facebook);
   if (!filter || filter === 'all' || filter === 'x') data = data.concat(extractedData.x);
+
+  // Keep MAIN_POST at top as a separate section (X only).
+  const mainPosts = data.filter(r => (r?.type || r?.kind) === 'MAIN_POST');
+  const others = data.filter(r => (r?.type || r?.kind) !== 'MAIN_POST');
 
   if (data.length === 0) {
     resultsEl.innerHTML = `<div class="empty-state">No results yet.</div>`;
     return;
   }
 
-  resultsEl.innerHTML = data.map(item => `
-    <div class="share-card">
-      <div class="name">${escapeHtml(item.username)}</div>
-      <div class="time">🕐 ${escapeHtml(item.time)}</div>
-      <div class="link">📄 <a href="${item.postUrl}" target="_blank">View Post</a></div>
-      ${item.groupUrl ? `<div class="link" style="color:#666">👥 Group: <a href="${item.groupUrl}" target="_blank">Link</a></div>` : ''}
-    </div>
-  `).join('');
+  const sectionTitle = (text) => `
+    <div style="font-size:11px; color:#65676b; margin:10px 0 6px; text-transform:uppercase; letter-spacing:0.4px;">${escapeHtml(text)}</div>
+  `;
+
+  const renderCard = (item) => {
+    const href = (item && (item.postUrl || item.tweetUrl || item.profileUrl)) ? String(item.postUrl || item.tweetUrl || item.profileUrl) : '';
+    const safeHref = href === 'undefined' || href === 'null' ? '' : href;
+    const linkLabel = item?.type === 'REPOST' ? 'View Profile' : 'View Post';
+    const views = item?.viewCount ? String(item.viewCount) : '';
+
+    return `
+      <div class="share-card">
+        <div class="name">${escapeHtml(item.username)}</div>
+        <div class="time">🕐 ${escapeHtml(item.time)}</div>
+        ${views ? `<div class="time">👁️ ${escapeHtml(views)} Views</div>` : ''}
+        ${safeHref ? `<div class="link">📄 <a href="${escapeHtml(safeHref)}" target="_blank">${linkLabel}</a></div>` : ''}
+        ${item.groupUrl ? `<div class="link" style="color:#666">👥 Group: <a href="${escapeHtml(item.groupUrl)}" target="_blank">Link</a></div>` : ''}
+      </div>
+    `;
+  };
+
+  let html = '';
+  if (mainPosts.length) {
+    html += sectionTitle('Main Post');
+    html += mainPosts.map(renderCard).join('');
+  }
+  if (others.length) {
+    html += sectionTitle('Others');
+    html += others.map(renderCard).join('');
+  }
+  resultsEl.innerHTML = html;
 }
 
 function escapeHtml(text) {
@@ -216,6 +959,88 @@ async function runExtractionOnPage(platform) {
   const processedIds = new Set();
   const wait = (ms) => new Promise(r => setTimeout(r, ms));
   const DATE_REGEX = /[A-Z][a-z]+ \d{1,2} [A-Z][a-z]+ \d{4} at \d{1,2}:\d{2}|[A-Z][a-z]+, [A-Z][a-z]+ \d{1,2}, \d{4}/;
+
+  function safeParseIsoTime(timeText) {
+    if (!timeText) return "";
+    try {
+      const d = new Date(timeText);
+      if (!Number.isNaN(d.getTime())) return d.toISOString();
+    } catch (e) {}
+    return "";
+  }
+
+  function sanitizeFacebookUrl(rawHref) {
+    if (!rawHref) return "";
+    try {
+      const url = new URL(rawHref, location.href);
+      url.hash = "";
+
+      const preserveQueryForPaths = new Set(["/profile.php", "/permalink.php", "/story.php", "/photo.php", "/video.php"]);
+      const shouldPreserveQuery = preserveQueryForPaths.has(url.pathname);
+
+      const allowList = new Set();
+      if (url.pathname === "/profile.php") {
+        allowList.add("id");
+      } else if (url.pathname === "/permalink.php") {
+        allowList.add("id");
+        allowList.add("story_fbid");
+      } else if (url.pathname === "/story.php") {
+        allowList.add("story_fbid");
+        allowList.add("id");
+      } else if (url.pathname === "/photo.php") {
+        allowList.add("fbid");
+        allowList.add("set");
+        allowList.add("id");
+      } else if (url.pathname === "/video.php") {
+        allowList.add("v");
+        allowList.add("id");
+      }
+
+      if (shouldPreserveQuery) {
+        // Drop common tracking params while preserving identifiers.
+        const next = new URLSearchParams();
+        for (const [k, v] of url.searchParams.entries()) {
+          if (allowList.size > 0) {
+            if (allowList.has(k)) next.append(k, v);
+          } else {
+            // fallback: keep nothing (shouldn't happen for preserved paths)
+          }
+        }
+        url.search = next.toString();
+      } else {
+        // Most FB URLs: query is largely tracking; strip it.
+        url.search = "";
+      }
+
+      return url.toString();
+    } catch (e) {
+      return String(rawHref).split('#')[0];
+    }
+  }
+
+  function getTimestampFromLink(link) {
+    if (!link) return "";
+
+    const candidates = [];
+    const a = (link.getAttribute('aria-label') || '').trim();
+    if (a) candidates.push(a);
+
+    const spanAria = link.querySelector('span[aria-label]')?.getAttribute('aria-label');
+    if (spanAria) candidates.push(String(spanAria).trim());
+
+    const abbrTitle = link.querySelector('abbr')?.getAttribute('title');
+    if (abbrTitle) candidates.push(String(abbrTitle).trim());
+
+    const timeEl = link.querySelector('time');
+    const timeDt = (timeEl?.getAttribute('datetime') || timeEl?.dateTime || '').trim();
+    if (timeDt) candidates.push(timeDt);
+
+    // As a last resort (may be relative like "1d")
+    const txt = (link.textContent || '').trim();
+    if (txt && txt.length <= 16) candidates.push(txt);
+
+    return candidates[0] || "";
+  }
 
   // --- X/Twitter Logic ---
   if (platform !== 'facebook') {
@@ -409,6 +1234,13 @@ async function runExtractionOnPage(platform) {
   if (!scrollableDiv) scrollableDiv = dialog;
   console.log("Scroll container:", scrollableDiv.className.substring(0, 50) + "...");
 
+  // If user manually scrolled to the end before running, virtualization means we only see the tail.
+  // Reset to top so we can collect everything consistently.
+  try {
+    scrollableDiv.scrollTop = 0;
+  } catch (e) {}
+  await wait(1200);
+
   // 1. Setup Tooltip Observer
   let foundTooltipText = null;
   const observer = new MutationObserver((mutations) => {
@@ -446,20 +1278,59 @@ async function runExtractionOnPage(platform) {
     element.dispatchEvent(new MouseEvent('mouseover', opts));
     element.dispatchEvent(new MouseEvent('mouseenter', opts));
     
-    for(let i = 0; i < 3; i++) {
-        await wait(50); 
-        const moveOpts = { ...opts, clientX: x + i };
-        element.dispatchEvent(new PointerEvent('pointermove', moveOpts));
-        element.dispatchEvent(new MouseEvent('mousemove', moveOpts));
+    for (let i = 0; i < 6; i++) {
+      await wait(60);
+      const moveOpts = { ...opts, clientX: x + i, clientY: y + (i % 2) };
+      element.dispatchEvent(new PointerEvent('pointermove', moveOpts));
+      element.dispatchEvent(new MouseEvent('mousemove', moveOpts));
     }
   }
 
   // 3. Extraction Loop
-  let noNewDataCount = 0;
+  let noProgressStreak = 0;
   let safetyCount = 0;
   let isScrollingFinished = false;
 
-  while (!isScrollingFinished && safetyCount < 200) {
+  const startTime = Date.now();
+  let lastProcessedSize = 0;
+
+  function getVisibleRowSignature() {
+    const rows = Array.from(dialog.querySelectorAll('[data-ad-rendering-role="profile_name"]')).slice(0, 10);
+    return rows.map(r => (r.textContent || '').trim().slice(0, 80)).join('|');
+  }
+
+  async function waitForSignatureChange(prevSig, timeoutMs) {
+    const start = Date.now();
+    let sig = prevSig;
+    while (Date.now() - start < timeoutMs) {
+      sig = getVisibleRowSignature();
+      if (sig && sig !== prevSig) return sig;
+      await wait(250);
+    }
+    return sig;
+  }
+
+  function isAtBottom() {
+    if (!scrollableDiv) return true;
+    return (scrollableDiv.scrollTop + scrollableDiv.clientHeight) >= (scrollableDiv.scrollHeight - 4);
+  }
+
+  function isPrivacyNoteLikelyReached() {
+    const privacyEl = Array.from(dialog.querySelectorAll('span,div')).find(n =>
+      (n.textContent || '').includes('Some posts may not appear here')
+    );
+    if (!privacyEl || !scrollableDiv) return false;
+    try {
+      const pr = privacyEl.getBoundingClientRect();
+      const cr = scrollableDiv.getBoundingClientRect();
+      // Only treat it as end-of-list if it's within/near the visible scroll viewport.
+      return pr.top >= (cr.top - 24) && pr.bottom <= (cr.bottom + 24);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  while (!isScrollingFinished && safetyCount < 600) {
     const rows = Array.from(dialog.querySelectorAll('[data-ad-rendering-role="profile_name"]'));
     let newItemsInPass = 0;
 
@@ -469,19 +1340,19 @@ async function runExtractionOnPage(platform) {
         let groupUrl = "";
         let profileUrl = "";
 
-        const headerLinks = Array.from(row.querySelectorAll('a'));
+        const headerLinks = Array.from(row.querySelectorAll('a[href]')).filter(a => !!a.href);
         
         if (headerLinks.length > 0) {
             // First link is User
             const userLink = headerLinks[0];
             username = userLink.textContent.trim();
-            profileUrl = userLink.href.split('?')[0];
+            profileUrl = sanitizeFacebookUrl(userLink.href);
 
             // Second link (if exists and different) is Group
             if (headerLinks.length > 1) {
                 const potentialGroup = headerLinks[1];
                 if (potentialGroup.textContent.trim() !== username) {
-                    groupUrl = potentialGroup.href.split('?')[0];
+                  groupUrl = sanitizeFacebookUrl(potentialGroup.href);
                 }
             }
         } else {
@@ -489,7 +1360,7 @@ async function runExtractionOnPage(platform) {
             if (nameEl) username = nameEl.textContent.trim();
         }
 
-        const uniqueId = username + profileUrl;
+        const uniqueId = `${username}|${profileUrl}|${groupUrl}`;
         if (processedIds.has(uniqueId)) continue;
 
         // -- FIND TIMESTAMP LINK --
@@ -505,13 +1376,13 @@ async function runExtractionOnPage(platform) {
                 const h = l.href;
                 const isPost = h.includes('/posts/') || h.includes('/permalink/') || h.includes('/photo') || h.includes('/video');
                 // Ensure it's not the profile link
-                return isPost && !h.includes(profileUrl);
+              return isPost && (!profileUrl || !h.includes(profileUrl));
             });
             
             if (!candidate) {
                 candidate = links.find(l => {
                     const aria = l.getAttribute('aria-label');
-                    return aria && /\d{4}/.test(aria) && !l.href.includes(profileUrl) && !isGenericGroupLink(l.href);
+                return aria && /\d{4}/.test(aria) && (!profileUrl || !l.href.includes(profileUrl)) && !isGenericGroupLink(l.href);
                 });
             }
 
@@ -519,7 +1390,7 @@ async function runExtractionOnPage(platform) {
                 candidate = links.find(l => 
                     l.href && 
                     l.href.length > 25 && 
-                    !l.href.includes(profileUrl) && 
+                (!profileUrl || !l.href.includes(profileUrl)) && 
                     !isGenericGroupLink(l.href) &&
                     !l.textContent.includes("Comment")
                 );
@@ -537,24 +1408,29 @@ async function runExtractionOnPage(platform) {
             const originalBorder = timestampLink.style.border;
             timestampLink.style.border = "2px solid blue";
 
+          // Prefer aria-label / abbr / time[datetime] (more reliable than hover tooltips).
+          let finalTime = getTimestampFromLink(timestampLink);
+          if (!finalTime || finalTime.length < 4) {
             await triggerDeepHover(timestampLink);
 
             let attempts = 0;
-            while(!foundTooltipText && attempts < 20) {
-                await wait(100);
-                attempts++;
+            // Slower pages need longer; still keep it bounded.
+            while (!foundTooltipText && attempts < 45) {
+            await wait(120);
+            attempts++;
             }
+            finalTime = foundTooltipText || getTimestampFromLink(timestampLink) || "Hover failed";
+          }
 
-            let finalTime = foundTooltipText;
-            let isoTime = "";
-            let postUrl = timestampLink.href.split('?')[0];
+          let isoTime = safeParseIsoTime(finalTime);
+          let postUrl = sanitizeFacebookUrl(timestampLink.href);
 
-            if (finalTime) {
+          if (finalTime && finalTime !== "Hover failed") {
                 timestampLink.style.border = "2px solid #0f0";
-                try { isoTime = new Date(finalTime).toISOString(); } catch(e){}
             } else {
                 timestampLink.style.border = "2px solid orange";
                 finalTime = timestampLink.getAttribute('aria-label') || "Hover failed";
+            isoTime = safeParseIsoTime(finalTime);
             }
 
             results.push({ 
@@ -583,38 +1459,35 @@ async function runExtractionOnPage(platform) {
         await wait(50);
     }
 
-    // --- SCROLL LOGIC ---
-    if (newItemsInPass === 0) noNewDataCount++;
-    else noNewDataCount = 0;
-
-    const hasPrivacyText = dialog.innerText.includes("Some posts may not appear here");
+    // --- SCROLL LOGIC (virtualized + slow-load friendly) ---
+    const progressed = processedIds.size > lastProcessedSize;
+    lastProcessedSize = processedIds.size;
+    if (!progressed && newItemsInPass === 0) noProgressStreak++;
+    else noProgressStreak = 0;
 
     if (scrollableDiv) {
-        const previousHeight = scrollableDiv.scrollHeight;
-        
-        // Scroll to absolute bottom
-        scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
-        await wait(2000); 
+      const prevSig = getVisibleRowSignature();
 
-        if (scrollableDiv.scrollHeight > previousHeight) {
-            console.log("New content loaded...");
-            continue;
-        } 
-        
-        // Double Tap
-        await wait(1500);
-        scrollableDiv.scrollTop = scrollableDiv.scrollHeight;
-        await wait(1500);
-        
-        if (scrollableDiv.scrollHeight > previousHeight) continue;
+      // Step-scroll instead of jumping to absolute bottom. Jumping can skip virtualized segments.
+      const step = Math.max(240, Math.floor(scrollableDiv.clientHeight * 0.85));
+      scrollableDiv.scrollTop = Math.min(scrollableDiv.scrollTop + step, scrollableDiv.scrollHeight);
 
-        // Final check
-        if (hasPrivacyText || (scrollableDiv.scrollHeight <= previousHeight && noNewDataCount > 1)) {
-            console.log("End of list reached.");
-            isScrollingFinished = true;
-        }
-    } else {
+      // Wait longer when FB is slow so we don't mis-detect end-of-list.
+      await waitForSignatureChange(prevSig, progressed ? 2500 : 6500);
+      await wait(300);
+
+      const hitMaxTime = (Date.now() - startTime) > (8 * 60 * 1000);
+      const likelyEnd = (noProgressStreak >= 5) && (isAtBottom() || isPrivacyNoteLikelyReached());
+
+      if (hitMaxTime) {
+        console.log("Stopping: max time reached.");
         isScrollingFinished = true;
+      } else if (likelyEnd) {
+        console.log("End of list reached (stabilized).", { noProgressStreak });
+        isScrollingFinished = true;
+      }
+    } else {
+      isScrollingFinished = true;
     }
     safetyCount++;
   }
@@ -639,17 +1512,17 @@ async function runExtractionOnPage(platform) {
     let groupUrl = "";
     let profileUrl = "";
 
-    const headerLinks = Array.from(row.querySelectorAll('a'));
+    const headerLinks = Array.from(row.querySelectorAll('a[href]')).filter(a => !!a.href);
     
     if (headerLinks.length > 0) {
       const userLink = headerLinks[0];
       username = userLink.textContent.trim();
-      profileUrl = userLink.href.split('?')[0];
+      profileUrl = sanitizeFacebookUrl(userLink.href);
 
       if (headerLinks.length > 1) {
         const potentialGroup = headerLinks[1];
         if (potentialGroup.textContent.trim() !== username) {
-          groupUrl = potentialGroup.href.split('?')[0];
+          groupUrl = sanitizeFacebookUrl(potentialGroup.href);
         }
       }
     } else {
@@ -657,7 +1530,7 @@ async function runExtractionOnPage(platform) {
       if (nameEl) username = nameEl.textContent.trim();
     }
 
-    const uniqueId = username + profileUrl;
+    const uniqueId = `${username}|${profileUrl}|${groupUrl}`;
     if (processedIds.has(uniqueId)) continue;
 
     // Find timestamp link
@@ -671,13 +1544,13 @@ async function runExtractionOnPage(platform) {
       let candidate = links.find(l => {
         const h = l.href;
         const isPost = h.includes('/posts/') || h.includes('/permalink/') || h.includes('/photo') || h.includes('/video');
-        return isPost && !h.includes(profileUrl);
+        return isPost && (!profileUrl || !h.includes(profileUrl));
       });
       
       if (!candidate) {
         candidate = links.find(l => {
           const aria = l.getAttribute('aria-label');
-          return aria && /\d{4}/.test(aria) && !l.href.includes(profileUrl) && !isGenericGroupLink(l.href);
+          return aria && /\d{4}/.test(aria) && (!profileUrl || !l.href.includes(profileUrl)) && !isGenericGroupLink(l.href);
         });
       }
 
@@ -685,7 +1558,7 @@ async function runExtractionOnPage(platform) {
         candidate = links.find(l => 
           l.href && 
           l.href.length > 25 && 
-          !l.href.includes(profileUrl) && 
+          (!profileUrl || !l.href.includes(profileUrl)) && 
           !isGenericGroupLink(l.href) &&
           !l.textContent.includes("Comment")
         );
@@ -703,24 +1576,27 @@ async function runExtractionOnPage(platform) {
       const originalBorder = timestampLink.style.border;
       timestampLink.style.border = "2px solid blue";
 
-      await triggerDeepHover(timestampLink);
+      let finalTime = getTimestampFromLink(timestampLink);
+      if (!finalTime || finalTime.length < 4) {
+        await triggerDeepHover(timestampLink);
 
-      let attempts = 0;
-      while(!foundTooltipText && attempts < 20) {
-        await wait(100);
-        attempts++;
+        let attempts = 0;
+        while(!foundTooltipText && attempts < 45) {
+          await wait(120);
+          attempts++;
+        }
+        finalTime = foundTooltipText || getTimestampFromLink(timestampLink) || "Hover failed";
       }
 
-      let finalTime = foundTooltipText;
-      let isoTime = "";
-      let postUrl = timestampLink.href.split('?')[0];
+      let isoTime = safeParseIsoTime(finalTime);
+      let postUrl = sanitizeFacebookUrl(timestampLink.href);
 
-      if (finalTime) {
+      if (finalTime && finalTime !== "Hover failed") {
         timestampLink.style.border = "2px solid #0f0";
-        try { isoTime = new Date(finalTime).toISOString(); } catch(e){}
       } else {
         timestampLink.style.border = "2px solid orange";
         finalTime = timestampLink.getAttribute('aria-label') || "Hover failed";
+        isoTime = safeParseIsoTime(finalTime);
       }
 
       results.push({ 

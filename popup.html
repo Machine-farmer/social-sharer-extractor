@@ -1,7 +1,9 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Social Share Extractor</title>
   <style>
     * {
       margin: 0;
@@ -32,6 +34,46 @@
       font-size: 12px;
       opacity: 0.9;
     }
+
+    .build-badge {
+      margin-top: 6px;
+      font-size: 11px;
+      opacity: 0.92;
+    }
+
+    .js-indicator {
+      margin-top: 4px;
+      font-size: 10px;
+      opacity: 0.9;
+      padding: 2px 8px;
+      border-radius: 999px;
+      display: inline-block;
+      background: rgba(255, 255, 255, 0.18);
+    }
+
+    details.debug {
+      margin: 8px 12px 0;
+    }
+
+    details.debug summary {
+      font-size: 11px;
+      color: #65676b;
+      cursor: pointer;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    pre.debug-log {
+      margin-top: 8px;
+      white-space: pre-wrap;
+      font-size: 10px;
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 8px;
+      max-height: 120px;
+      overflow: auto;
+    }
     
     .controls {
       padding: 12px;
@@ -39,6 +81,7 @@
       border-bottom: 1px solid #ddd;
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
     }
     
     button {
@@ -243,14 +286,41 @@
   <div class="header">
     <h1>📊 Social Share Extractor</h1>
     <p>Extract shares with exact timestamps</p>
+    <div class="build-badge">v1.0.0 Beta • build 2026-03-13-01</div>
+    <div id="jsIndicator" class="js-indicator">JS: not loaded</div>
   </div>
   
   <div class="controls">
     <button id="extractBtn" class="primary-btn">🔍 Extract Shares</button>
     <button id="clearBtn" class="secondary-btn">🗑️ Clear</button>
+    <button id="resetBtn" class="secondary-btn">♻️ Reset</button>
   </div>
   
   <div id="status" class="status"></div>
+
+  <details class="debug" id="debugDetails">
+    <summary>Debug</summary>
+    <pre id="debugLog" class="debug-log">(no logs yet)</pre>
+
+    <div style="margin-top:8px; background:#fff; border:1px solid #ddd; border-radius:6px; padding:8px;">
+      <div style="font-size:11px; color:#65676b; margin-bottom:6px;">X Options</div>
+
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+        <label style="font-size:11px; color:#050505; flex:1;">Quote details tabs</label>
+        <input id="xMaxQuoteDetails" type="number" min="0" step="1" value="100" style="width:90px; padding:4px; border:1px solid #ccc; border-radius:4px; font-size:11px;" />
+      </div>
+      <div style="font-size:10px; color:#65676b; margin-bottom:8px;">0 = metadata only (fast). Increase to open quote tweet tabs.</div>
+
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+        <label style="font-size:11px; color:#050505; flex:1;">Max quotes minutes</label>
+        <input id="xMaxQuotesMinutes" type="number" min="1" step="1" value="1" style="width:90px; padding:4px; border:1px solid #ccc; border-radius:4px; font-size:11px;" />
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <label style="font-size:11px; color:#050505; flex:1;">Max retweets minutes</label>
+        <input id="xMaxRetweetsMinutes" type="number" min="1" step="1" value="1" style="width:90px; padding:4px; border:1px solid #ccc; border-radius:4px; font-size:11px;" />
+      </div>
+    </div>
+  </details>
   
   <div id="stats" class="stats">
     <div class="stat-item">
@@ -283,7 +353,8 @@
   <div id="exportOptions" class="export-options">
     <button id="exportJSON" class="export-btn">📄 JSON</button>
     <button id="exportCSV" class="export-btn">📊 CSV</button>
-    <button id="copyAll" class="export-btn">📋 Copy</button>
+    <button id="copyMain" class="export-btn">📋 Copy Main</button>
+    <button id="copyOthers" class="export-btn">📋 Copy Others</button>
   </div>
   
   <script src="popup.js"></script>
